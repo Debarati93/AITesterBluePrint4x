@@ -76,17 +76,72 @@ with col1:
                 st.subheader('LLM Prompt')
                 st.code(prompt)
 
+                # Clear any previous response stored in Streamlit session to avoid showing intermediate fragments
+                if 'latest_response' in st.session_state:
+                    try:
+                        del st.session_state['latest_response']
+                    except Exception:
+                        st.session_state['latest_response'] = ''
+
                 llm = LLMClient(settings)
                 with st.spinner('Generating test cases...'):
+                    # call LLM and capture final response only
                     response = llm.send_prompt(prompt)
 
+                # Sanitize response to remove any leftover JSON token fragments before display
+                def _sanitize_display(text: str) -> str:
+                    if not text:
+                        return ''
+                    import re
+                    # normalize concatenated objects
+                    t = text.replace('}{', '}' + '\n' + '{')
+                    t = t.replace('][', ']' + '\n' + '[')
+                    # remove common trailing streaming suffixes like ,"done":false or similar
+                    t = re.sub(r'\,?\s*"done"\s*:\s*(?:true|false)\s*', '', t, flags=re.IGNORECASE)
+                    # remove JSON objects/arrays that clearly contain model tokens
+                    t = re.sub(r'\{[^\}]*\"model\"[^\}]*\}', '', t, flags=re.DOTALL)
+                    t = re.sub(r'\[[^\]]*\"model\"[^\]]*\]', '', t, flags=re.DOTALL)
+                    # split into lines and filter out lines that look like JSON fragments
+                    out_lines = []
+                    for line in t.splitlines():
+                        s = line.strip()
+                        if not s:
+                            continue
+                        # skip if line is JSON-like and mentions model/response/done
+                        if (s.startswith('{') or s.startswith('[')) and ( '"model"' in s or '"response"' in s or '"done"' in s ):
+                            continue
+                        # skip lines that are mostly punctuation/quotes
+                        if re.fullmatch(r'[\[\]\{\}\"\,\:\s]+', s):
+                            continue
+                        # otherwise keep line
+                        out_lines.append(line)
+                    cleaned = '\n'.join(out_lines).strip()
+                    # collapse multiple blank lines
+                    cleaned = re.sub(r"\n\s*\n+", '\n\n', cleaned)
+                    if cleaned:
+                        return cleaned
+                    # aggressive fallback: remove any remaining JSON-like tokens and return what remains
+                    fallback = re.sub(r'\{[^\}]*\}', '', t)
+                    fallback = re.sub(r'\[[^\]]*\]', '', fallback)
+                    fallback = re.sub(r'\s+', ' ', fallback).strip()
+                    return fallback[:2000]
+
+                display_text = _sanitize_display(response)
+
+                # if sanitizer returned empty, show a friendly message instead of raw fragments
+                if not display_text:
+                    display_text = 'LLM returned no readable text. Try re-running or check LLM logs.'
+
+                # Store the final sanitized response in session state and display it — avoids showing any streaming fragments
+                st.session_state['latest_response'] = display_text
+
                 st.subheader('Generated Test Cases')
-                st.markdown(response)
+                st.markdown(st.session_state.get('latest_response', ''))
 
                 # Save option
                 if st.button('Save to outputs'):
                     out_file = OUTPUTS / f"{jira_key or 'ad-hoc'}_test_cases.md"
-                    out_file.write_text(response, encoding='utf-8')
+                    out_file.write_text(st.session_state.get('latest_response',''), encoding='utf-8')
                     st.success(f'Saved to {out_file}')
 
 with col2:

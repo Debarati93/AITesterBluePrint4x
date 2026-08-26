@@ -3,6 +3,8 @@ import socket
 import json
 from urllib.parse import urlparse
 
+import re
+
 class LLMClient:
     def __init__(self, settings: dict):
         self.settings = settings or {}
@@ -81,6 +83,9 @@ class LLMClient:
                 return '\n'.join([p for p in parts if p])
         except Exception:
             pass
+        # Normalize concatenated JSON objects that may appear without newlines, e.g. '}{' -> '}\n{'
+        text = text.replace('}{', '}' + '\n' + '{')
+
         # Handle newline-delimited JSON (streaming tokens)
         out_parts = []
         for line in text.splitlines():
@@ -91,8 +96,20 @@ class LLMClient:
                 obj = json.loads(line)
                 # Ollama streaming may use 'response' or 'text' keys
                 if isinstance(obj, dict):
+                    # Some streams wrap token fragments under 'response' or 'response' may itself be a dict/list
                     if 'response' in obj:
-                        out_parts.append(obj.get('response') or '')
+                        val = obj.get('response')
+                        if isinstance(val, str):
+                            out_parts.append(val)
+                        elif isinstance(val, dict):
+                            # try common nested fields
+                            out_parts.append(val.get('text') or val.get('output') or '')
+                        elif isinstance(val, list):
+                            for item in val:
+                                if isinstance(item, dict):
+                                    out_parts.append(item.get('response') or item.get('text') or '')
+                                else:
+                                    out_parts.append(str(item))
                     elif 'text' in obj:
                         out_parts.append(obj.get('text') or '')
                     elif 'output' in obj:
@@ -103,8 +120,70 @@ class LLMClient:
                 # not JSON, append raw
                 out_parts.append(line)
         if out_parts:
-            return ''.join(out_parts)
-        return text
+            cleaned = ''.join(out_parts)
+            return self._postprocess_output(cleaned)
+        return self._postprocess_output(text)
+
+    def _postprocess_output(self, text: str) -> str:
+        """Try to extract readable text from streaming JSON fragments or concatenated objects.
+        If JSON objects are found, prefer their 'response'/'text'/'output' fields concatenated.
+        Otherwise, return original text with harmless cleanup (strip trailing/leading whitespace).
+        """
+        if not text:
+            return text
+        # Quick heuristics: if text contains repeated JSON-like objects, extract them
+        # Normalize concatenated objects
+        norm = text.replace('}{', '}' + '\n' + '{')
+        # find JSON objects that include a model/response or text key
+        objs = []
+        try:
+            for m in re.finditer(r'\{\s*"model".*?\}', norm, flags=re.DOTALL):
+                s = m.group(0)
+                try:
+                    objs.append(json.loads(s))
+                except Exception:
+                    continue
+        except Exception:
+            objs = []
+
+        if objs:
+            parts = []
+            for o in objs:
+                if isinstance(o, dict):
+                    val = o.get('response') or o.get('text') or o.get('output')
+                    if isinstance(val, str) and val:
+                        parts.append(val)
+                    elif isinstance(val, list):
+                        for it in val:
+                            if isinstance(it, dict):
+                                parts.append(it.get('response') or it.get('text') or '')
+                            else:
+                                parts.append(str(it))
+            candidate = ''.join(parts).strip()
+            if candidate:
+                return candidate
+
+        # fallback: try to strip any leading JSON tokens like lines starting with {"model"
+        cleaned_lines = []
+        for line in norm.splitlines():
+            l = line.strip()
+            if not l:
+                continue
+            if l.startswith('{') and '"model"' in l:
+                # try to parse and extract response/text
+                try:
+                    o = json.loads(l)
+                    val = o.get('response') or o.get('text') or o.get('output')
+                    if isinstance(val, str) and val:
+                        cleaned_lines.append(val)
+                        continue
+                except Exception:
+                    pass
+                # otherwise skip this token line
+                continue
+            cleaned_lines.append(line)
+        result = '\n'.join(cleaned_lines).strip()
+        return result
 
     def _call_groq(self, prompt: str, timeout=30) -> str:
         # Placeholder Groq call - uses groq.ai or groq.com API endpoint if available.
